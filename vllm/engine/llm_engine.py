@@ -344,7 +344,8 @@ class LLMEngine:
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         # Initialize the cache.
-        self.req_to_token_pool, self.token_to_kv_pool = self._run_workers("init_cache_engine", size=self.cache_config.num_gpu_blocks)
+        # why does it do this? lol
+        self.req_to_token_pool, self.token_to_kv_pool = self._run_workers("init_cache_engine", size=self.cache_config.num_gpu_blocks)[0]
         # Warm up the model. This includes capturing the model into CUDA graph
         # if enforce_eager is False.
 
@@ -803,6 +804,7 @@ class LLMEngine:
 
         if not scheduler_outputs.is_empty():
             # Execute the model.
+
             all_outputs = self._run_workers(
                 "execute_model",
                 driver_kwargs={
@@ -810,6 +812,7 @@ class LLMEngine:
                     "blocks_to_swap_in": scheduler_outputs.blocks_to_swap_in,
                     "blocks_to_swap_out": scheduler_outputs.blocks_to_swap_out,
                     "blocks_to_copy": scheduler_outputs.blocks_to_copy,
+                    "scheduler_outputs": scheduler_outputs
                 })
 
             # Only the driver worker returns the sampling results.

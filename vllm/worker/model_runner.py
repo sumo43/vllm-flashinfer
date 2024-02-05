@@ -125,7 +125,7 @@ class ModelRunner:
         for seq_group_metadata in seq_group_metadata_list:
             assert seq_group_metadata.is_prompt
             seq_ids = list(seq_group_metadata.seq_data.keys())
-            assert len(seq_ids) == 1
+            #assert len(seq_ids) == 1
             seq_id = seq_ids[0]
 
             seq_data = seq_group_metadata.seq_data[seq_id]
@@ -134,12 +134,11 @@ class ModelRunner:
             prompt_lens.append(prompt_len)
             prefix_len = 0
             prefix = seq_group_metadata.prefix
-            if prefix is not None and prefix.computed:
-                prefix_len = prefix.get_length()
-                prompt_tokens = prompt_tokens[prefix_len:]
-                prefix_block_tables.append(prefix.get_block_numbers())
-            else:
-                prefix_block_tables.append([])
+            #if prefix is not None and prefix.computed:
+            #    prefix_len = prefix.get_length()
+            #    prompt_tokens = prompt_tokens[prefix_len:]
+            #    prefix_block_tables.append(prefix.get_block_numbers())
+            prefix_block_tables.append([])
             # actual prompt lens
             context_lens.append(prefix_len)
             subquery_lens.append(prompt_len - prefix_len)
@@ -149,47 +148,6 @@ class ModelRunner:
             # is always the first token in the sequence.
             input_positions.append(
                 list(range(prefix_len, prefix_len + len(prompt_tokens))))
-
-            lora_id = seq_group_metadata.lora_int_id
-
-            if lora_id > 0:
-                lora_requests.add(seq_group_metadata.lora_request)
-
-            lora_index_mapping.append([lora_id] * (prompt_len - prefix_len))
-            lora_prompt_mapping.extend(
-                [lora_id] *
-                (prompt_len - prefix_len
-                 if seq_group_metadata.sampling_params.prompt_logprobs else 1))
-
-            if seq_group_metadata.block_tables is None:
-                # During memory profiling, the block tables are not initialized
-                # yet. In this case, we just use a dummy slot mapping.
-                slot_mapping.append([_PAD_SLOT_ID] * prompt_len)
-                continue
-
-            # Compute the slot mapping.
-            slot_mapping.append([])
-            block_table = seq_group_metadata.block_tables[seq_id]
-            # Mask the [0, start_idx) tokens of the prompt with _PAD_SLOT_ID,
-            # where start_idx is max(0, prompt_len - sliding_window).
-            # For example, if the prompt len is 10, sliding window is 8, and
-            # block size is 4, the first two tokens are masked and the slot
-            # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
-            start_idx = 0
-            if self.sliding_window is not None:
-                assert prefix_len == 0, (
-                    "Prefix caching is currently not supported with "
-                    "sliding window attention")
-                start_idx = max(0, prompt_len - self.sliding_window)
-            for i in range(prefix_len, prompt_len):
-                if i < start_idx:
-                    slot_mapping[-1].append(_PAD_SLOT_ID)
-                    continue
-
-                block_number = block_table[i // self.block_size]
-                block_offset = i % self.block_size
-                slot = block_number * self.block_size + block_offset
-                slot_mapping[-1].append(slot)
 
         max_prompt_len = max(subquery_lens)
         input_tokens = _make_tensor_with_pad(input_tokens,
@@ -541,8 +499,12 @@ class ModelRunner:
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
-        profile = False
+        profile = False,
+        scheduler_outputs = None
     ) -> Optional[SamplerOutput]:
+
+        print(scheduler_outputs)
+        exit(0)
         (input_tokens, input_positions, input_metadata, sampling_metadata,
          lora_requests,
          lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list)

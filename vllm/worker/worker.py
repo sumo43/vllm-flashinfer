@@ -163,7 +163,7 @@ class Worker:
             layer_num=32
         )
 
-        return req_to_token_pool, token_to_kv_pool
+        return self.req_to_token_pool, self.token_to_kv_pool
 
         print("init cache success")
         #exit(0)
@@ -216,6 +216,7 @@ class Worker:
         blocks_to_swap_in: Optional[Dict[int, int]] = None,
         blocks_to_swap_out: Optional[Dict[int, int]] = None,
         blocks_to_copy: Optional[Dict[int, List[int]]] = None,
+        scheduler_outputs = None
     ) -> Optional[SamplerOutput]:
         if self.is_driver_worker:
             assert seq_group_metadata_list is not None
@@ -244,7 +245,7 @@ class Worker:
             return {}
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.gpu_cache)
+                                                 self.gpu_cache, scheduler_outputs=scheduler_outputs)
         print("model executed")
         return output
 

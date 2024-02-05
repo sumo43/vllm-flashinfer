@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceStatus)
 from vllm.prefix import PrefixPool
+import torch
 
 logger = init_logger(__name__)
 
@@ -39,6 +40,11 @@ class SchedulerOutputs:
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
         ignored_seq_groups: List[SequenceGroup],
+        req_pool_indices,
+        seq_lens,
+        position_ids_offsets,
+        extend_num_tokens,
+        out_cache_loc
     ) -> None:
         self.scheduled_seq_groups = scheduled_seq_groups
         self.prompt_run = prompt_run
@@ -53,7 +59,11 @@ class SchedulerOutputs:
         self.num_loras = len(self.lora_requests)
         if self.num_loras > 0:
             self._sort_by_lora_ids()
-
+        self.req_pool_indices = req_pool_indices 
+        self.seq_lens = seq_lens
+        self.position_ids_offsets = position_ids_offsets
+        self.extend_num_tokens = extend_num_tokens 
+        self.out_cache_loc = out_cache_loc 
     def is_empty(self) -> bool:
         # NOTE: We do not consider the ignored sequence groups.
         return (not self.scheduled_seq_groups and not self.blocks_to_swap_in
@@ -143,7 +153,7 @@ class Scheduler:
             for seq_group in state_queue:
                 if not request_ids:
                     # Using 'break' here may add two extra iterations,
-                    # but is acceptable to reduce complexity .
+                    # but is acceptable to reduce compl exit .
                     break
                 if seq_group.request_id in request_ids:
                     # Appending aborted group into pending list.
@@ -190,6 +200,12 @@ class Scheduler:
             # sequence groups are added to the front and the new sequence groups
             # are added to the back.
             leftover_waiting_sequences = deque()
+
+            print("pre-allocating req_to_token_pool for WAITING")
+
+            req_pool_indices = self.req_to_token_pool.alloc(len(self.waiting))
+            req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+
             while self.waiting:
                 seq_group = self.waiting[0]
                 waiting_seqs = seq_group.get_seqs(
@@ -209,22 +225,9 @@ class Scheduler:
                     continue
 
                 # If the sequence group cannot be allocated, stop.
-                can_allocate = AllocStatus.OK #self.token_to_kv_pool.can_alloc
-                #can_allocate = self.block_manager.can_allocate(seq_group)
-                #if can_allocate == AllocStatus.LATER:
-                #    break
-                #elif can_allocate == AllocStatus.NEVER:
-                #    logger.warning(
-                #        f"Input prompt ({num_prompt_tokens} tokens) is too long"
-                #        f" and exceeds the capacity of block_manager")
-                #    for seq in waiting_seqs:
-                #        seq.status = SequenceStatus.FINISHED_IGNORED
-                #    ignored_seq_groups.append(seq_group)
-                #    self.waiting.popleft()
-                #    continue
+                can_allocate = AllocStatus.OK 
 
                 # If the number of batched tokens exceeds the limit, stop.
-
                 new_seq_lens = seq_lens + [num_prompt_tokens]
                 num_batched_tokens = len(new_seq_lens) * max(new_seq_lens)
                 if (num_batched_tokens > (self.token_to_kv_pool.size - self.token_to_kv_pool.alloc_ct)):
@@ -242,17 +245,45 @@ class Scheduler:
                     break
                 seq_lens = new_seq_lens
 
-                if lora_int_id > 0:
-                    curr_loras.add(lora_int_id)
+                #if lora_int_id > 0:
+                #    curr_loras.add(lora_int_id)
                 self.waiting.popleft()
-                self._allocate(seq_group)
+                #self._allocate(seq_group)
                 self.running.append(seq_group)
                 num_curr_seqs += num_new_seqs
                 scheduled.append(seq_group)
 
-            self.waiting.extendleft(leftover_waiting_sequences)
+            num_batched_tokens = len(seq_lens) * max(seq_lens)
+
+            # Alloc mem for WAITING
+            # seq_lens is an array so it's a non-ragged batch
+            # seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+            out_cache_loc = self.token_to_kv_pool.alloc(num_batched_tokens)
+
+            if out_cache_loc is None:
+                raise ValueError('out of cache.')
+
+            pt = 0
+            for i in range(len(self.running)):
+                self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+                    0 : seq_lens[i]
+                ] = out_cache_loc[pt : pt + seq_lens[i]]
+                pt += seq_lens[i]
+
+            #self.waiting.extendleft(leftover_waiting_sequences)
 
             if scheduled or ignored_seq_groups:
+
+                req_pool_indices = req_pool_indices
+                seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda:0")
+                #self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+
+                #position_ids_offsets = position_ids_offsets
+                position_ids_offsets = torch.zeros((len(self.running),), dtype=torch.int32, device="cuda:0")
+
+                extend_num_tokens = num_batched_tokens 
+                out_cache_loc = out_cache_loc
+
                 scheduler_outputs = SchedulerOutputs(
                     scheduled_seq_groups=scheduled,
                     prompt_run=True,
@@ -262,13 +293,20 @@ class Scheduler:
                     blocks_to_swap_out=blocks_to_swap_out,
                     blocks_to_copy=blocks_to_copy,
                     ignored_seq_groups=ignored_seq_groups,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    position_ids_offsets=position_ids_offsets,
+                    extend_num_tokens=extend_num_tokens,
+                    out_cache_loc=out_cache_loc
                 )
+   
                 return scheduler_outputs
 
         # NOTE(woosuk): Preemption happens only when there is no available slot
         # to keep all the sequence groups in the RUNNING state.
         # In this case, the policy is responsible for deciding which sequence
         # groups to preempt.
+
         self.running = self.policy.sort_by_priority(now, self.running)
 
 
@@ -312,43 +350,20 @@ class Scheduler:
         self.running = running
 
         # Set fields
-        self.input_ids = torch.tensor(
-            flatten_input_ids, dtype=torch.int32, device=device
-        )
-        self.pixel_values = [r.pixel_values for r in reqs]
-        self.image_sizes = [r.image_size for r in reqs]
-        self.image_offsets = [
-            r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
-        ]
+
+        # needed
         self.req_pool_indices = req_pool_indices
+
+        # needed ..?
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+
+        # needed ..?
         self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+
+        # needed
         self.position_ids_offsets = position_ids_offsets
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
-
-        self.temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
-        self.top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        ).view(-1, 1)
-        self.top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
-        ).view(-1, 1)
-        self.frequency_penalties = torch.tensor(
-            [r.sampling_params.frequency_penalty for r in reqs],
-            dtype=torch.float,
-            device=device,
-        )
-        self.presence_penalties = torch.tensor(
-            [r.sampling_params.presence_penalty for r in reqs],
-            dtype=torch.float,
-            device=device,
-        )
-        self.logit_bias = logit_bias
 
         # Each sequence in the generation phase only takes one token slot.
         # Therefore, the number of batched tokens is equal to the number of
@@ -382,7 +397,7 @@ class Scheduler:
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data
-                block_tables[seq_id] = self.block_manager.get_block_table(seq)
+                block_tables[seq_id] = None #self.block_manager.get_block_table(seq)
 
             seq_group_metadata = SequenceGroupMetadata(
                 request_id=seq_group.request_id,
@@ -394,6 +409,7 @@ class Scheduler:
                 prefix=seq_group.prefix,
             )
             seq_group_metadata_list.append(seq_group_metadata)
+
         return seq_group_metadata_list, scheduler_outputs
 
     #def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
