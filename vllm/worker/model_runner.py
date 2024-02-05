@@ -108,8 +108,30 @@ class ModelRunner:
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
+        profile=False
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, List[int], List[int],
                List[int], List[int], Set[LoRARequest]]:
+            
+        print(seq_group_metadata_list[0].__dict__)
+        
+        if not profile:
+            input_metadata = InputMetadata(
+            is_prompt=True,
+            slot_mapping=None,
+            prompt_lens=None,
+            max_seq_len=None,
+            start_loc=None,
+            max_context_len=None,
+            context_lens=None,
+            block_tables=None,
+            use_cuda_graph=False,
+            kv_cache_dtype=self.kv_cache_dtype,
+            )
+
+            return (None, None, input_metadata, None,
+                    None, None, None,
+                    None)
+            
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
@@ -202,6 +224,8 @@ class ModelRunner:
             use_cuda_graph=False,
             kv_cache_dtype=self.kv_cache_dtype,
         )
+
+        print("one")
         return (input_tokens, input_positions, input_metadata, prompt_lens,
                 subquery_lens, lora_index_mapping, lora_prompt_mapping,
                 lora_requests)
@@ -344,6 +368,7 @@ class ModelRunner:
         selected_token_start_idx = 0
         categorized_sample_indices = {t: [] for t in SamplingType}
         categorized_sample_indices_start_idx = 0
+        print(prompt_lens)
 
         max_subquery_len = max(subquery_lens) if subquery_lens else 1
         for i, seq_group_metadata in enumerate(seq_group_metadata_list):
@@ -353,7 +378,11 @@ class ModelRunner:
 
             if seq_group_metadata.is_prompt:
                 assert len(seq_ids) == 1
+                print(prompt_lens)
+                subquery_lens = prompt_lens
+                print(prompt_lens)
                 assert subquery_lens is not None
+                #sub
                 subquery_len = subquery_lens[i]
                 if sampling_params.prompt_logprobs is not None:
                     # NOTE: prompt token positions do not need sample, skip
@@ -412,6 +441,8 @@ class ModelRunner:
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
+        scheduler_outputs,
+        profile=False
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, SamplingMetadata,
                Set[int], LoRAMapping]:
         if self.is_driver_worker:
@@ -422,27 +453,21 @@ class ModelRunner:
             if is_prompt:
                 (input_tokens, input_positions, input_metadata, prompt_lens,
                  subquery_lens, lora_index_mapping, lora_prompt_mapping,
-                 lora_requests) = self._prepare_prompt(seq_group_metadata_list)
+                 lora_requests) = self._prepare_prompt(seq_group_metadata_list, profile)
             else:
                 (input_tokens, input_positions, input_metadata,
                  lora_index_mapping, lora_prompt_mapping,
                  lora_requests) = self._prepare_decode(seq_group_metadata_list)
                 prompt_lens = []
                 subquery_lens = None
+            print(input_metadata.__dict__)
+            exit(0)
             sampling_metadata = self._prepare_sample(seq_group_metadata_list,
-                                                     prompt_lens,
+                                                     input_metadata.prompt_lens,
                                                      subquery_lens)
 
-            if self.lora_config:
-                flat_lora_index_mapping = [
-                    item for sublist in lora_index_mapping for item in sublist
-                ]
-                lora_mapping = LoRAMapping(
-                    flat_lora_index_mapping,
-                    lora_prompt_mapping,
-                )
-            else:
-                lora_mapping = None
+     
+            lora_mapping = None
 
             # Broadcast the metadata.
             metadata_dict = {
@@ -470,18 +495,38 @@ class ModelRunner:
             input_positions = metadata_dict["input_positions"]
             lora_mapping = metadata_dict["lora_mapping"]
             lora_requests = metadata_dict["lora_requests"]
-            input_metadata = InputMetadata(
-                is_prompt=metadata_dict["is_prompt"],
-                slot_mapping=metadata_dict["slot_mapping"],
-                prompt_lens=metadata_dict["prompt_lens"],
-                max_seq_len=metadata_dict["max_seq_len"],
-                start_loc=metadata_dict["start_loc"],
-                max_context_len=metadata_dict["max_context_len"],
-                context_lens=metadata_dict["context_lens"],
-                block_tables=metadata_dict["block_tables"],
-                use_cuda_graph=metadata_dict["use_cuda_graph"],
-                kv_cache_dtype=metadata_dict["kv_cache_dtype"],
-            )
+
+            if scheduler_outputs is not None:
+                input_metadata = InputMetadata(
+                    is_prompt=metadata_dict["is_prompt"],
+                    slot_mapping=metadata_dict["slot_mapping"],
+                    prompt_lens=metadata_dict["prompt_lens"],
+                    max_seq_len=metadata_dict["max_seq_len"],
+                    start_loc=metadata_dict["start_loc"],
+                    max_context_len=metadata_dict["max_context_len"],
+                    context_lens=metadata_dict["context_lens"],
+                    block_tables=metadata_dict["block_tables"],
+                    use_cuda_graph=metadata_dict["use_cuda_graph"],
+                    kv_cache_dtype=metadata_dict["kv_cache_dtype"],
+                    req_pool_indices=scheduler_outputs.req_pool_indices,
+                    seq_lens=scheduler_outputs.seq_lens,
+                    position_ids_offsets=scheduler_outputs.position_ids_offsets,
+                    extend_num_tokens=scheduler_outputs.extend_num_tokens,
+                    out_cache_loc=scheduler_outputs.out_cache_loc
+                )
+            else:
+                input_metadata = InputMetadata(
+                    is_prompt=metadata_dict["is_prompt"],
+                    slot_mapping=metadata_dict["slot_mapping"],
+                    prompt_lens=metadata_dict["prompt_lens"],
+                    max_seq_len=metadata_dict["max_seq_len"],
+                    start_loc=metadata_dict["start_loc"],
+                    max_context_len=metadata_dict["max_context_len"],
+                    context_lens=metadata_dict["context_lens"],
+                    block_tables=metadata_dict["block_tables"],
+                    use_cuda_graph=metadata_dict["use_cuda_graph"],
+                    kv_cache_dtype=metadata_dict["kv_cache_dtype"],
+                )
             sampling_metadata = SamplingMetadata(
                 seq_groups=None,
                 seq_data=None,
@@ -503,11 +548,9 @@ class ModelRunner:
         scheduler_outputs = None
     ) -> Optional[SamplerOutput]:
 
-        print(scheduler_outputs)
-        exit(0)
         (input_tokens, input_positions, input_metadata, sampling_metadata,
          lora_requests,
-         lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list)
+         lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list, scheduler_outputs)
 
         num_qo_heads = 32
         num_kv_heads = 8

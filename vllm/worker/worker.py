@@ -243,6 +243,8 @@ class Worker:
         # If there is no input, we don't need to execute the model.
         if num_seq_groups == 0:
             return {}
+        
+        print(scheduler_outputs)
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
                                                  self.gpu_cache, scheduler_outputs=scheduler_outputs)
