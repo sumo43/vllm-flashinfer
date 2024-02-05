@@ -18,7 +18,7 @@ from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.model_runner import ModelRunner
 from vllm.lora.request import LoRARequest
-
+from vllm.memory_pool import ReqToTokenPool, TokenToKVPool
 
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
@@ -126,9 +126,12 @@ class Worker:
         torch.cuda.synchronize()
         free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
         peak_memory = total_gpu_memory - free_gpu_memory
+        cache_block_size = 1
 
-        cache_block_size = CacheEngine.get_cache_block_size(
-            block_size, cache_dtype, self.model_config, self.parallel_config)
+        #cache_block_size = CacheEngine.get_cache_block_size(
+        #    block_size, cache_dtype, self.model_config, self.parallel_config)
+
+
         num_gpu_blocks = int(
             (total_gpu_memory * gpu_memory_utilization - peak_memory) //
             cache_block_size)
@@ -141,13 +144,37 @@ class Worker:
         torch.cuda.empty_cache()
         return num_gpu_blocks, num_cpu_blocks
 
-    def init_cache_engine(self, cache_config: CacheConfig) -> None:
-        self.cache_config = cache_config
-        self.cache_engine = CacheEngine(self.cache_config, self.model_config,
-                                        self.parallel_config)
+    def init_cache_engine(self, size: int) -> None:
+        #self.cache_config = cache_config
+
+        #print(27000 * 16)
+        #print(int(size / (8128 * 256)))
+
+        self.req_to_token_pool = ReqToTokenPool(
+            int(size/ (8128 * 256)),
+            8128+ 8,
+        )
+
+        self.token_to_kv_pool = TokenToKVPool(
+            27000 * 16,
+            dtype=torch.float16,
+            head_num=8,
+            head_dim=128,
+            layer_num=32
+        )
+
+        return req_to_token_pool, token_to_kv_pool
+
+        print("init cache success")
+        #exit(0)
+
+        #self.cache_engine = CacheEngine(self.cache_config, self.model_config,
+        #                                self.parallel_config)
         #self.cache_events = self.cache_engine.events
-        self.gpu_cache = self.cache_engine.gpu_cache
-        self.model_runner.set_block_size(self.cache_engine.block_size)
+        #self.gpu_cache = self.cache_engine.gpu_cache
+        #self.model_runner.set_block_size(self.cache_engine.block_size)
+        #self.req_to_token_pool = ReqToTokenPool
+
 
     def warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:

@@ -77,6 +77,8 @@ class Scheduler:
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
         lora_config: Optional[LoRAConfig],
+        req_to_token_pool,
+        token_to_kv_pool
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -91,11 +93,16 @@ class Scheduler:
         # Instantiate the scheduling policy.
         self.policy = PolicyFactory.get_policy(policy_name="fcfs")
         # Create the block space manager.
-        self.block_manager = BlockSpaceManager(
-            block_size=self.cache_config.block_size,
-            num_gpu_blocks=self.cache_config.num_gpu_blocks,
-            num_cpu_blocks=self.cache_config.num_cpu_blocks,
-            sliding_window=self.cache_config.sliding_window)
+        #self.block_manager = BlockSpaceManager(
+        #    block_size=self.cache_config.block_size,
+        #    num_gpu_blocks=self.cache_config.num_gpu_blocks,
+        #    num_cpu_blocks=self.cache_config.num_cpu_blocks,
+        #    sliding_window=self.cache_config.sliding_window)
+
+        # we are using token_to_kv_pool instead
+
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool = token_to_kv_pool
 
         # Create the prefix pool to cache the prefixes.
         self.prefix_pool = PrefixPool(self.cache_config.block_size)
@@ -202,35 +209,25 @@ class Scheduler:
                     continue
 
                 # If the sequence group cannot be allocated, stop.
-                can_allocate = self.block_manager.can_allocate(seq_group)
-                if can_allocate == AllocStatus.LATER:
-                    break
-                elif can_allocate == AllocStatus.NEVER:
-                    logger.warning(
-                        f"Input prompt ({num_prompt_tokens} tokens) is too long"
-                        f" and exceeds the capacity of block_manager")
-                    for seq in waiting_seqs:
-                        seq.status = SequenceStatus.FINISHED_IGNORED
-                    ignored_seq_groups.append(seq_group)
-                    self.waiting.popleft()
-                    continue
-
-                lora_int_id = 0
-                if self.lora_enabled:
-                    lora_int_id = seq_group.lora_int_id
-                    if lora_int_id > 0 and lora_int_id not in curr_loras and len(
-                            curr_loras) >= self.lora_config.max_loras:
-                        # We don't have a space for another LoRA, so
-                        # we ignore this request for now.
-                        leftover_waiting_sequences.appendleft(seq_group)
-                        self.waiting.popleft()
-                        continue
+                can_allocate = AllocStatus.OK #self.token_to_kv_pool.can_alloc
+                #can_allocate = self.block_manager.can_allocate(seq_group)
+                #if can_allocate == AllocStatus.LATER:
+                #    break
+                #elif can_allocate == AllocStatus.NEVER:
+                #    logger.warning(
+                #        f"Input prompt ({num_prompt_tokens} tokens) is too long"
+                #        f" and exceeds the capacity of block_manager")
+                #    for seq in waiting_seqs:
+                #        seq.status = SequenceStatus.FINISHED_IGNORED
+                #    ignored_seq_groups.append(seq_group)
+                #    self.waiting.popleft()
+                #    continue
 
                 # If the number of batched tokens exceeds the limit, stop.
+
                 new_seq_lens = seq_lens + [num_prompt_tokens]
                 num_batched_tokens = len(new_seq_lens) * max(new_seq_lens)
-                if (num_batched_tokens >
-                        self.scheduler_config.max_num_batched_tokens):
+                if (num_batched_tokens > (self.token_to_kv_pool.size - self.token_to_kv_pool.alloc_ct)):
                     break
 
                 # The total number of sequences in the RUNNING state should not
@@ -274,73 +271,84 @@ class Scheduler:
         # groups to preempt.
         self.running = self.policy.sort_by_priority(now, self.running)
 
+
+        # alloc req pool indices
+        req_pool_indices = self.req_to_token_pool.alloc(len(self.running))
+        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+
+
         # Reserve new token slots for the running sequence groups.
         running: Deque[SequenceGroup] = deque()
         preempted: List[SequenceGroup] = []
-        while self.running:
-            seq_group = self.running.popleft()
-            while not self.block_manager.can_append_slot(seq_group):
-                if self.running:
-                    # Preempt the lowest-priority sequence groups.
-                    victim_seq_group = self.running.pop()
-                    self._preempt(victim_seq_group, blocks_to_swap_out)
-                    preempted.append(victim_seq_group)
-                else:
-                    # No other sequence groups can be preempted.
-                    # Preempt the current sequence group.
-                    self._preempt(seq_group, blocks_to_swap_out)
-                    preempted.append(seq_group)
-                    break
-            else:
-                # Append new slots to the sequence group.
-                self._append_slot(seq_group, blocks_to_copy)
-                running.append(seq_group)
+
+        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
+
+        # Alloc mem
+        seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+        extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
+        out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+        if out_cache_loc is None:
+            if not self.tree_cache.disable:
+                self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
+                out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+
+            if out_cache_loc is None:
+                print("Prefill out of memory. This should nerver happen.")
+                self.tree_cache.pretty_print()
+                exit()
+
+        pt = 0
+        for i in range(self.running):
+            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
+                prefix_lens[i] : prefix_lens[i] + extend_lens[i]
+            ] = out_cache_loc[pt : pt + extend_lens[i]]
+            pt += extend_lens[i]
+
+        #while self.running:
+        #        # Append new slots to the sequence group.
+        #        self._append_slot(seq_group, blocks_to_copy)
+        #        running.append(seq_group)
+
         self.running = running
 
-        # Swap in the sequence groups in the SWAPPED state if possible.
-        self.swapped = self.policy.sort_by_priority(now, self.swapped)
-        if not preempted:
-            num_curr_seqs = sum(seq_group.get_max_num_running_seqs()
-                                for seq_group in self.running)
-            curr_loras = set(
-                seq_group.lora_int_id
-                for seq_group in self.running) if self.lora_enabled else None
+        # Set fields
+        self.input_ids = torch.tensor(
+            flatten_input_ids, dtype=torch.int32, device=device
+        )
+        self.pixel_values = [r.pixel_values for r in reqs]
+        self.image_sizes = [r.image_size for r in reqs]
+        self.image_offsets = [
+            r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
+        ]
+        self.req_pool_indices = req_pool_indices
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+        self.position_ids_offsets = position_ids_offsets
+        self.extend_num_tokens = extend_num_tokens
+        self.out_cache_loc = out_cache_loc
 
-            leftover_swapped = deque()
-
-            while self.swapped:
-                seq_group = self.swapped[0]
-                lora_int_id = 0
-                if self.lora_enabled:
-                    lora_int_id = seq_group.lora_int_id
-                    if lora_int_id > 0 and lora_int_id not in curr_loras and len(
-                            curr_loras) >= self.lora_config.max_loras:
-                        # We don't have a space for another LoRA, so
-                        # we ignore this request for now.
-                        leftover_swapped.appendleft(seq_group)
-                        self.swapped.popleft()
-                        continue
-
-                # If the sequence group cannot be swapped in, stop.
-                if not self.block_manager.can_swap_in(seq_group):
-                    break
-
-                # The total number of sequences in the RUNNING state should not
-                # exceed the maximum number of sequences.
-                num_new_seqs = seq_group.get_max_num_running_seqs()
-                if (num_curr_seqs + num_new_seqs >
-                        self.scheduler_config.max_num_seqs):
-                    break
-
-                if lora_int_id > 0:
-                    curr_loras.add(lora_int_id)
-                self.swapped.popleft()
-                self._swap_in(seq_group, blocks_to_swap_in)
-                self._append_slot(seq_group, blocks_to_copy)
-                num_curr_seqs += num_new_seqs
-                self.running.append(seq_group)
-
-            self.swapped.extendleft(leftover_swapped)
+        self.temperatures = torch.tensor(
+            [r.sampling_params.temperature for r in reqs],
+            dtype=torch.float,
+            device=device,
+        ).view(-1, 1)
+        self.top_ps = torch.tensor(
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+        ).view(-1, 1)
+        self.top_ks = torch.tensor(
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
+        ).view(-1, 1)
+        self.frequency_penalties = torch.tensor(
+            [r.sampling_params.frequency_penalty for r in reqs],
+            dtype=torch.float,
+            device=device,
+        )
+        self.presence_penalties = torch.tensor(
+            [r.sampling_params.presence_penalty for r in reqs],
+            dtype=torch.float,
+            device=device,
+        )
+        self.logit_bias = logit_bias
 
         # Each sequence in the generation phase only takes one token slot.
         # Therefore, the number of batched tokens is equal to the number of
@@ -388,11 +396,11 @@ class Scheduler:
             seq_group_metadata_list.append(seq_group_metadata)
         return seq_group_metadata_list, scheduler_outputs
 
-    def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
-        self.block_manager.fork(parent_seq, child_seq)
+    #def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
+    #    self.block_manager.fork(parent_seq, child_seq)
 
     def free_seq(self, seq: Sequence) -> None:
-        self.block_manager.free(seq)
+        self.token_to_kv_pool.free(seq)
 
     def free_finished_seq_groups(self) -> None:
         self.running = deque(seq_group for seq_group in self.running

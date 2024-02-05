@@ -117,7 +117,7 @@ class LLMEngine:
         self._init_cache()
 
         # Create the scheduler.
-        self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+        self.scheduler = Scheduler(scheduler_config, cache_config, lora_config, self.req_to_token_pool, self.token_to_kv_pool)
 
         # Metric Logging.
         if self.log_stats:
@@ -344,10 +344,14 @@ class LLMEngine:
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         # Initialize the cache.
-        self._run_workers("init_cache_engine", cache_config=self.cache_config)
+        self.req_to_token_pool, self.token_to_kv_pool = self._run_workers("init_cache_engine", size=self.cache_config.num_gpu_blocks)
         # Warm up the model. This includes capturing the model into CUDA graph
         # if enforce_eager is False.
+
+        print("ran cache engine")
         self._run_workers("warm_up_model")
+
+        print("warmed up model")
 
     @classmethod
     def from_engine_args(cls, engine_args: EngineArgs) -> "LLMEngine":
