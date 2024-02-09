@@ -69,8 +69,8 @@ class PagedAttention(nn.Module):
         value: torch.Tensor,
         key_cache: Optional[torch.Tensor],
         value_cache: Optional[torch.Tensor],
-        kv_cache: Optional[torch.Tensor], # flashinfer format
         input_metadata: InputMetadata,
+        kv_cache: Optional[torch.Tensor] = None, # flashinfer format
     ) -> torch.Tensor:
         """PagedAttention forward pass.
 
@@ -88,7 +88,7 @@ class PagedAttention(nn.Module):
         """
         batch_size, seq_len, hidden_size = query.shape
         # Reshape the query, key, and value tensors.
-        query = query.view(-1, self.num_heads, self.head_size)
+        query = query.view(-1, self.num_heads, self.head_size).contiguous()
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
 
@@ -99,7 +99,7 @@ class PagedAttention(nn.Module):
 
         if input_metadata.flashinfer:
             if kv_cache is not None:
-                cache_ops.reshape_and_cache(key, value, kv_cache,
+                cache_ops.reshape_and_cache_flashinfer(key, value, kv_cache,
                                         input_metadata.slot_mapping.flatten(),
                                         "auto")
 
@@ -117,7 +117,7 @@ class PagedAttention(nn.Module):
         if input_metadata.is_prompt:
             # Prompt run.
 
-            def run_xattn():
+            def run_xattn(query, key, value):
                 if self.num_kv_heads != self.num_heads:
                     # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
                     # project the key and value tensors to the desired number of
@@ -191,21 +191,23 @@ class PagedAttention(nn.Module):
                         input_metadata.max_seq_len,
                         getattr(self, "alibi_slopes", None),
                     )
+
+                return output
             
             if input_metadata.flashinfer:
                 # old attn
                 query = query.contiguous()
                 if kv_cache is None:
-                    run_xattn()
+                    output = run_xattn(query, key, value)
                 
                 elif input_metadata.block_tables.numel() == 0:
-                    query = query.view(-1, self.num_kv_heads, self.head_size)
+                    #query = query.view(-1, self.num_kv_heads, self.head_size)
                     #output = input_metadata.prefill_wrapper.forward(
                     #    query, kv_cache, causal=True)
                     output = flashinfer.single_prefill_with_kv_cache(query, key.contiguous(), value.contiguous(), causal=True)
 
             else:
-                run_xattn()
+                output = run_xattn(query, key, value)
 
         else:
             if input_metadata.flashinfer:

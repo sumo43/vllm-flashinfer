@@ -102,10 +102,10 @@ class OPTAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         if input_metadata.flashinfer:
-            attn_output = self.attn(q, k, v, kv_cache=kv_cache, input_metadata=input_metadata)
+            attn_output = self.attn(q, k, v, None, None, input_metadata, kv_cache)
         else:
             k_cache, v_cache = kv_cache
-            attn_output = self.attn(q, k, v, k_cache=key_cache, v_cache=value_cache, input_metadata=input_metadata)
+            attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
         output, _ = self.out_proj(attn_output)
         return output
 

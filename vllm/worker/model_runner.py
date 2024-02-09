@@ -548,6 +548,7 @@ class ModelRunner:
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+        profile=False
     ) -> Optional[SamplerOutput]:
         (input_tokens, input_positions, input_metadata, sampling_metadata,
          lora_requests,
@@ -564,22 +565,26 @@ class ModelRunner:
             else:
                 num_qo_heads = self.model.config.num_attention_heads
                 num_kv_heads = self.model.config.num_attention_heads
+
+            hidden_size = self.model.config.hidden_size
             
             if not profile and input_metadata.is_prompt and input_metadata.decode_wrapper:
                 input_metadata.decode_wrapper.end_forward()
                 self.wrapper_set = False
 
-            if not profile and not input_metadata.is_prompt:
+            if not profile and not input_metadata.is_prompt and not self.wrapper_set:
                 input_metadata.decode_wrapper = self.decode_wrapper
                 batch_size = input_tokens.shape[0]
 
                 kvi = input_metadata.slot_mapping.view(-1).type(
-                    torch.int32).to(self.device)
+                    torch.int32)
 
-                kvd = input_metadata.block_tables.to(self.device)
+                kvd = input_metadata.block_tables
 
                 kvi = kvi[kvi != -1]
                 kvd = kvd[kvd != 0]
+                kvi = kvi.to(self.device)
+                kvd = kvd.to(self.device)
 
                 paged_kv_indices = kvd
                 bsi = []
@@ -604,7 +609,7 @@ class ModelRunner:
                     paged_kv_last_page_len,
                     num_qo_heads,
                     num_kv_heads,
-                    hidden_size // num_kv_heads,
+                    hidden_size // num_qo_heads,
                     16,
                 )
 
@@ -681,8 +686,11 @@ class ModelRunner:
 
         # Run the model with the dummy inputs.
         num_layers = self.model_config.get_num_layers(self.parallel_config)
-        kv_caches = [(None, None)] * num_layers
-        self.execute_model(seqs, kv_caches)
+        if self.flashinfer:
+            kv_caches = [None] * num_layers
+        else:
+            kv_caches = [(None, None)] * num_layers
+        self.execute_model(seqs, kv_caches, profile=True)
         torch.cuda.synchronize()
         return
 

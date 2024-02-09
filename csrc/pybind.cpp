@@ -77,7 +77,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     "Reshape the key and value tensors and cache them");
   cache_ops.def(
     "reshape_and_cache_flashinfer",
-    &reshape_and_cache,
+    &reshape_and_cache_flashinfer,
     "Reshape the key and value tensors and cache them. flashinfer format, with single kvcache tensor");
   cache_ops.def(
     "gather_cached_kv",
