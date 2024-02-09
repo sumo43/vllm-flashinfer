@@ -1,5 +1,4 @@
 from typing import Optional
-
 import torch
 
 
@@ -27,6 +26,8 @@ class InputMetadata:
         block_tables: Optional[torch.Tensor],
         use_cuda_graph: bool,
         kv_cache_dtype: str,
+        flashinfer: bool = None,
+        prefill_wrapper = None
     ) -> None:
         self.is_prompt = is_prompt
         self.prompt_lens = prompt_lens
@@ -42,6 +43,9 @@ class InputMetadata:
         # Set during the execution of the first attention op.
         # FIXME(woosuk): This is a hack.
         self.attn_bias = None
+
+        self.flashinfer = flashinfer
+        self.prefill_wrapper = prefill_wrapper
 
     def __repr__(self) -> str:
         return ("InputMetadata("

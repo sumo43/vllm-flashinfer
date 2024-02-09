@@ -34,10 +34,11 @@ class CacheEngine:
         self.head_size = model_config.get_head_size()
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
+        self.flashinfer = model_config.flashinfer
 
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
-        self.num_cpu_blocks = cache_config.num_cpu_blocks
+        self.num_cpu_blocks = cache_config.num_cpu_blocks   
 
         if cache_config.cache_dtype == "auto":
             self.dtype = model_config.dtype
@@ -45,8 +46,14 @@ class CacheEngine:
             self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
         # Initialize the cache.
-        self.gpu_cache = self.allocate_gpu_cache()
-        self.cpu_cache = self.allocate_cpu_cache()
+
+        if self.flashinfer:
+            self.gpu_cache = self.allocate_gpu_cache_flashinfer()
+            self.cpu_cache = self.allocate_cpu_cache_flashinfer()
+        
+        else:
+            self.gpu_cache = self.allocate_gpu_cache()
+            self.cpu_cache = self.allocate_cpu_cache()
 
         # Initialize the stream for caching operations.
         self.cache_stream = torch.cuda.Stream()
@@ -70,6 +77,20 @@ class CacheEngine:
             self.head_size,
             self.block_size,
         )
+
+    def allocate_gpu_cache_flashinfer(self) -> List[KVCache]:
+        gpu_cache = []
+        for _ in range(self.num_layers):
+            gpu_blocks =  torch.empty(self.num_gpu_blocks, 2, self.block_size, self.num_heads, self.head_size, dtype=self.dtype, device="cuda")
+            gpu_cache.append(gpu_blocks)
+        return gpu_cache
+    
+    def allocate_cpu_cache_flashinfer(self) -> List[KVCache]:
+        cpu_cache = []
+        for _ in range(self.num_layers):
+            cpu_blocks =  torch.empty(self.num_gpu_blocks, 2, self.block_size, self.num_heads, self.head_size, dtype=self.dtype, device="cpu")
+            cpu_cache.append(cpu_blocks)
+        return cpu_cache
 
     def allocate_gpu_cache(self) -> List[KVCache]:
         gpu_cache: List[KVCache] = []

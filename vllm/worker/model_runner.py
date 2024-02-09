@@ -18,6 +18,11 @@ from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
 from vllm.utils import in_wsl
 
+try:
+    import flashinfer
+except ImportError:
+    pass
+
 logger = init_logger(__name__)
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
@@ -74,6 +79,16 @@ class ModelRunner:
         # cache in_wsl result
         self.in_wsl = in_wsl()
         self.kv_cache_dtype = kv_cache_dtype
+
+        # flashinfer
+        self.flashinfer = model_config.flashinfer
+        self.wrapper_set = False
+        workspace_buffer = torch.empty(16 * 1024 * 1024,
+                                       dtype=torch.uint8,
+                                       device=self.device)
+        self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer, "NHD")
+ 
 
     def load_model(self) -> None:
         self.model = get_model(self.model_config, self.device_config,
@@ -537,6 +552,61 @@ class ModelRunner:
         (input_tokens, input_positions, input_metadata, sampling_metadata,
          lora_requests,
          lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list)
+
+        if self.flashinfer: 
+
+            input_metadata.flashinfer = True
+            
+            if "num_key_value_heads" in self.model.config.__dict__.keys():
+                num_qo_heads = self.model.config.num_attention_heads
+                num_kv_heads = self.model.config.num_key_value_heads
+
+            else:
+                num_qo_heads = self.model.config.num_attention_heads
+                num_kv_heads = self.model.config.num_attention_heads
+            
+            if not profile and input_metadata.is_prompt and input_metadata.decode_wrapper:
+                input_metadata.decode_wrapper.end_forward()
+                self.wrapper_set = False
+
+            if not profile and not input_metadata.is_prompt:
+                input_metadata.decode_wrapper = self.decode_wrapper
+                batch_size = input_tokens.shape[0]
+
+                kvi = input_metadata.slot_mapping.view(-1).type(
+                    torch.int32).to(self.device)
+
+                kvd = input_metadata.block_tables.to(self.device)
+
+                kvi = kvi[kvi != -1]
+                kvd = kvd[kvd != 0]
+
+                paged_kv_indices = kvd
+                bsi = []
+                for i in range(batch_size):
+                    mask = input_metadata.block_tables[i] != 0
+                    bsi.append(len(input_metadata.block_tables[i][mask].unique_consecutive()))
+
+            
+                block_sizes_per_seq = torch.tensor(bsi)
+
+                paged_kv_indptr = torch.zeros((batch_size + 1, ),
+                                            dtype=torch.int32,
+                                            device=self.device)
+
+                paged_kv_indptr[1:] = torch.cumsum(block_sizes_per_seq, dim=0)
+                
+                paged_kv_last_page_len = kvi % 16 + 1
+                
+                input_metadata.decode_wrapper.begin_forward(
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_len,
+                    num_qo_heads,
+                    num_kv_heads,
+                    hidden_size // num_kv_heads,
+                    16,
+                )
 
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)

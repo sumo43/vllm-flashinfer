@@ -18,6 +18,10 @@ _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512
 
+try:
+    import flashinfer
+except ImportError:
+    pass
 
 class PagedAttention(nn.Module):
     """MHA/MQA/GQA layer with PagedAttention.
@@ -65,6 +69,7 @@ class PagedAttention(nn.Module):
         value: torch.Tensor,
         key_cache: Optional[torch.Tensor],
         value_cache: Optional[torch.Tensor],
+        kv_cache: Optional[torch.Tensor], # flashinfer format
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
         """PagedAttention forward pass.
@@ -91,103 +96,134 @@ class PagedAttention(nn.Module):
         # If key_cache and value_cache are not provided, the new key and value
         # vectors will not be cached. This happens during the initial memory
         # profiling run.
-        if key_cache is not None and value_cache is not None:
-            cache_ops.reshape_and_cache(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                input_metadata.slot_mapping.flatten(),
-                input_metadata.kv_cache_dtype,
-            )
+
+        if input_metadata.flashinfer:
+            if kv_cache is not None:
+                cache_ops.reshape_and_cache(key, value, kv_cache,
+                                        input_metadata.slot_mapping.flatten(),
+                                        "auto")
+
+        else:
+            if key_cache is not None and value_cache is not None:
+                cache_ops.reshape_and_cache(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    input_metadata.slot_mapping.flatten(),
+                    input_metadata.kv_cache_dtype,
+                )
 
         if input_metadata.is_prompt:
             # Prompt run.
-            if self.num_kv_heads != self.num_heads:
-                # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
-                # project the key and value tensors to the desired number of
-                # heads.
-                # TODO(woosuk): Use MQA/GQA kernels for higher performance.
-                query = query.view(query.shape[0], self.num_kv_heads,
-                                   self.num_queries_per_kv, query.shape[-1])
-                key = key[:, :,
-                          None, :].expand(key.shape[0], self.num_kv_heads,
-                                          self.num_queries_per_kv,
-                                          key.shape[-1])
-                value = value[:, :, None, :].expand(value.shape[0],
-                                                    self.num_kv_heads,
-                                                    self.num_queries_per_kv,
-                                                    value.shape[-1])
-            # normal attention
-            if (key_cache is None or value_cache is None
-                    or input_metadata.block_tables.numel() == 0):
-                # Set attention bias if not provided. This typically happens at
-                # the very attention layer of every iteration.
-                # FIXME(woosuk): This is a hack.
-                if input_metadata.attn_bias is None:
+
+            def run_xattn():
+                if self.num_kv_heads != self.num_heads:
+                    # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
+                    # project the key and value tensors to the desired number of
+                    # heads.
+                    # TODO(woosuk): Use MQA/GQA kernels for higher performance.
+                    query = query.view(query.shape[0], self.num_kv_heads,
+                                    self.num_queries_per_kv, query.shape[-1])
+                    key = key[:, :,
+                            None, :].expand(key.shape[0], self.num_kv_heads,
+                                            self.num_queries_per_kv,
+                                            key.shape[-1])
+                    value = value[:, :, None, :].expand(value.shape[0],
+                                                        self.num_kv_heads,
+                                                        self.num_queries_per_kv,
+                                                        value.shape[-1])
+                # normal attention
+                if (key_cache is None or value_cache is None
+                        or input_metadata.block_tables.numel() == 0):
+                    # Set attention bias if not provided. This typically happens at
+                    # the very attention layer of every iteration.
+                    # FIXME(woosuk): This is a hack.
+                    if input_metadata.attn_bias is None:
+                        if self.alibi_slopes is None:
+                            attn_bias = BlockDiagonalCausalMask.from_seqlens(
+                                [seq_len] * batch_size)
+                            if self.sliding_window is not None:
+                                attn_bias = attn_bias.make_local_attention(
+                                    self.sliding_window)
+                            input_metadata.attn_bias = attn_bias
+                        else:
+                            input_metadata.attn_bias = _make_alibi_bias(
+                                self.alibi_slopes, self.num_kv_heads, batch_size,
+                                seq_len, query.dtype)
+
+                    # TODO(woosuk): Too many view operations. Let's try to reduce
+                    # them in the future for code readability.
                     if self.alibi_slopes is None:
-                        attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                            [seq_len] * batch_size)
-                        if self.sliding_window is not None:
-                            attn_bias = attn_bias.make_local_attention(
-                                self.sliding_window)
-                        input_metadata.attn_bias = attn_bias
+                        query = query.unsqueeze(0)
+                        key = key.unsqueeze(0)
+                        value = value.unsqueeze(0)
                     else:
-                        input_metadata.attn_bias = _make_alibi_bias(
-                            self.alibi_slopes, self.num_kv_heads, batch_size,
-                            seq_len, query.dtype)
+                        query = query.unflatten(0, (batch_size, seq_len))
+                        key = key.unflatten(0, (batch_size, seq_len))
+                        value = value.unflatten(0, (batch_size, seq_len))
 
-                # TODO(woosuk): Too many view operations. Let's try to reduce
-                # them in the future for code readability.
-                if self.alibi_slopes is None:
-                    query = query.unsqueeze(0)
-                    key = key.unsqueeze(0)
-                    value = value.unsqueeze(0)
+                    out = xops.memory_efficient_attention_forward(
+                        query,
+                        key,
+                        value,
+                        attn_bias=input_metadata.attn_bias,
+                        p=0.0,
+                        scale=self.scale,
+                        op=xops.fmha.MemoryEfficientAttentionFlashAttentionOp[0] if
+                        (is_hip()) else None,
+                    )
+                    output = out.view_as(query)
                 else:
-                    query = query.unflatten(0, (batch_size, seq_len))
-                    key = key.unflatten(0, (batch_size, seq_len))
-                    value = value.unflatten(0, (batch_size, seq_len))
+                    # prefix-enabled attention
+                    output = torch.empty_like(query)
+                    context_attention_fwd(
+                        query,
+                        key,
+                        value,
+                        output,
+                        key_cache,
+                        value_cache,
+                        input_metadata.block_tables,  # [BS, max_block_per_request]
+                        input_metadata.start_loc,
+                        input_metadata.prompt_lens,
+                        input_metadata.context_lens,
+                        input_metadata.max_seq_len,
+                        getattr(self, "alibi_slopes", None),
+                    )
+            
+            if input_metadata.flashinfer:
+                # old attn
+                query = query.contiguous()
+                if kv_cache is None:
+                    run_xattn()
+                
+                elif input_metadata.block_tables.numel() == 0:
+                    query = query.view(-1, self.num_kv_heads, self.head_size)
+                    #output = input_metadata.prefill_wrapper.forward(
+                    #    query, kv_cache, causal=True)
+                    output = flashinfer.single_prefill_with_kv_cache(query, key.contiguous(), value.contiguous(), causal=True)
 
-                out = xops.memory_efficient_attention_forward(
-                    query,
-                    key,
-                    value,
-                    attn_bias=input_metadata.attn_bias,
-                    p=0.0,
-                    scale=self.scale,
-                    op=xops.fmha.MemoryEfficientAttentionFlashAttentionOp[0] if
-                    (is_hip()) else None,
-                )
-                output = out.view_as(query)
             else:
-                # prefix-enabled attention
-                output = torch.empty_like(query)
-                context_attention_fwd(
-                    query,
-                    key,
-                    value,
-                    output,
-                    key_cache,
-                    value_cache,
-                    input_metadata.block_tables,  # [BS, max_block_per_request]
-                    input_metadata.start_loc,
-                    input_metadata.prompt_lens,
-                    input_metadata.context_lens,
-                    input_metadata.max_seq_len,
-                    getattr(self, "alibi_slopes", None),
-                )
+                run_xattn()
 
         else:
-            # Decoding run.
-            output = _paged_attention(
+            if input_metadata.flashinfer:
+                output = input_metadata.decode_wrapper.forward(
                 query,
-                key_cache,
-                value_cache,
-                input_metadata,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-            )
+                kv_cache,
+                )
+            else:
+                # Decoding run.
+                output = _paged_attention(
+                    query,
+                    key_cache,
+                    value_cache,
+                    input_metadata,
+                    self.num_kv_heads,
+                    self.scale,
+                    self.alibi_slopes,
+                )
 
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
