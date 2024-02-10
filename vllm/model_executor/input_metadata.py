@@ -27,7 +27,8 @@ class InputMetadata:
         use_cuda_graph: bool,
         kv_cache_dtype: str,
         flashinfer: bool = None,
-        decode_wrapper = None
+        decode_wrapper = None,
+        prefill_wrapper = None
     ) -> None:
         self.is_prompt = is_prompt
         self.prompt_lens = prompt_lens
@@ -46,6 +47,7 @@ class InputMetadata:
 
         self.flashinfer = flashinfer
         self.decode_wrapper = decode_wrapper
+        self.prefill_wrapper = prefill_wrapper
 
     def __repr__(self) -> str:
         return ("InputMetadata("

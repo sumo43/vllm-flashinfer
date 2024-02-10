@@ -196,15 +196,15 @@ class PagedAttention(nn.Module):
             
             if input_metadata.flashinfer:
                 # old attn
-                query = query.contiguous()
+                # query = query.contiguous()
                 if kv_cache is None:
                     output = run_xattn(query, key, value)
                 
                 elif input_metadata.block_tables.numel() == 0:
                     #query = query.view(-1, self.num_kv_heads, self.head_size)
                     #output = input_metadata.prefill_wrapper.forward(
-                    #    query, kv_cache, causal=True)
-                    output = flashinfer.single_prefill_with_kv_cache(query, key.contiguous(), value.contiguous(), causal=True)
+                    #    query, kv_cache, causal=True, allow_fp16_qk_reduction=True)
+                    output = flashinfer.single_prefill_with_kv_cache(query, key.contiguous(), value.contiguous(), causal=True, allow_fp16_qk_reduction=True)
 
             else:
                 output = run_xattn(query, key, value)

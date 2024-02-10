@@ -555,17 +555,11 @@ class ModelRunner:
          lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list)
 
         if self.flashinfer: 
-
             input_metadata.flashinfer = True
             
-            if "num_key_value_heads" in self.model.config.__dict__.keys():
-                num_qo_heads = self.model.config.num_attention_heads
-                num_kv_heads = self.model.config.num_key_value_heads
 
-            else:
-                num_qo_heads = self.model.config.num_attention_heads
-                num_kv_heads = self.model.config.num_attention_heads
 
+            """
             hidden_size = self.model.config.hidden_size
             
             if not profile and input_metadata.is_prompt and input_metadata.decode_wrapper:
@@ -577,32 +571,130 @@ class ModelRunner:
                 batch_size = input_tokens.shape[0]
 
                 kvi = input_metadata.slot_mapping.view(-1).type(
-                    torch.int32)
+                    torch.int32).unique()
 
                 kvd = input_metadata.block_tables
+                block_tables = input_metadata.block_tables.cuda()
+
+                #unique = kvd.unique(return_counts=False, dim=-1)
 
                 kvi = kvi[kvi != -1]
                 kvd = kvd[kvd != 0]
                 kvi = kvi.to(self.device)
-                kvd = kvd.to(self.device)
+                #kvd = kvd.to(self.device)
 
                 paged_kv_indices = kvd
-                bsi = []
-                for i in range(batch_size):
-                    mask = input_metadata.block_tables[i] != 0
-                    bsi.append(len(input_metadata.block_tables[i][mask].unique_consecutive()))
 
+                #bsi = []
+                #for i in range(batch_size):
+                #    mask = input_metadata.block_tables[i] != 0
+                #    bsi.append(len(input_metadata.block_tables[i][mask].unique_consecutive()))
+
+                #mask = block_tables != 0  # Create boolean mask across entire tensor
+                #masked_elements = block_tables[mask]  # Extract all nonzero elements
+                unique = block_tables.unique(return_counts=False, dim=-1)
+                num_unique_elements = torch.sum(unique != 0, dim=1)
+
+                #bsi = counts.size(0)  # Size of counts = number of unique nonzero across the whole input
             
-                block_sizes_per_seq = torch.tensor(bsi)
+                #block_sizes_per_seq = torch.tensor(bsi)
+                #block_sizes_per_seq = counts
+                #print(num_unique_elements)
 
                 paged_kv_indptr = torch.zeros((batch_size + 1, ),
                                             dtype=torch.int32,
                                             device=self.device)
 
-                paged_kv_indptr[1:] = torch.cumsum(block_sizes_per_seq, dim=0)
+                paged_kv_indptr[1:] = torch.cumsum(num_unique_elements, dim=0)
+
+                #input_metadata.block_tables[i] 
                 
                 paged_kv_last_page_len = kvi % 16 + 1
+
+            """
+
+            if not profile and input_metadata.is_prompt and input_metadata.decode_wrapper:
+                input_metadata.decode_wrapper.end_forward()
+                self.wrapper_set = False
+
+            if not profile and not input_metadata.is_prompt and not self.wrapper_set:
+
+                input_metadata.decode_wrapper = self.decode_wrapper
+                batch_size = input_tokens.shape[0]
                 
+                prefix_lens = input_metadata.prompt_lens
+
+                if input_metadata.is_prompt:
+                    seq_lens = input_metadata.prompt_lens
+                else:
+                    seq_lens = input_metadata.context_lens
+                extend_seq_lens = input_metadata.context_lens
+                
+                if input_metadata.is_prompt:
+                    seq_lens = input_metadata.prompt_lens
+                else:
+                    seq_lens = input_metadata.context_lens
+                extend_seq_lens = input_metadata.context_lens
+
+                if input_metadata.is_prompt:
+                    qo_indptr = torch.zeros(
+                        (batch_size + 1,), dtype=torch.int32, device="cuda"
+                    )
+                    
+                    qo_indptr[1:] = torch.cumsum(input_metadata.prompt_lens, dim=0)
+
+                    input_metadata.qo_indptr = qo_indptr
+
+                kvi = input_metadata.slot_mapping.view(-1).type(torch.int32).to("cuda:0")
+                paged_kv_indices = torch.div(kvi, 16, rounding_mode="floor")
+                
+                paged_kv_indptr = torch.zeros(
+                (batch_size + 1,), dtype=torch.int32, device="cuda:0"
+                )
+                
+                #print(block_sizes_per_seq)
+
+                if "num_key_value_heads" in self.model.config.__dict__.keys():
+                    num_qo_heads = self.model.config.num_attention_heads
+                    num_kv_heads = self.model.config.num_key_value_heads
+
+                else:
+                    num_qo_heads = self.model.config.num_attention_heads
+                    num_kv_heads = self.model.config.num_attention_heads
+                    
+                hidden_size = self.model.config.hidden_size
+                
+                if input_metadata.is_prompt:
+                    block_sizes_per_seq = torch.tensor([len(input_metadata.slot_mapping[i].unique()) for i in range(batch_size)])
+
+                    paged_kv_indptr[1:] = torch.cumsum(block_sizes_per_seq, dim=0)
+                    
+                else:
+
+                    paged_kv_indptr = torch.zeros((batch_size + 1, ),
+                                            dtype=torch.int32,
+                                            device=self.device)
+                    
+                    unique = input_metadata.block_tables.unique_consecutive(return_counts=False, dim=-1)
+                    num_unique_elements = torch.sum(unique != 0, dim=1)
+
+                    paged_kv_indptr[1:] = torch.cumsum(num_unique_elements, dim=0)
+                    #paged_kv_indptr[1:] = torch.arange(1, batch_size + 1)
+
+                paged_kv_last_page_len = (kvi % 16) + 1
+
+                kvd = input_metadata.block_tables
+                block_tables = input_metadata.block_tables.cuda()
+
+                #unique = kvd.unique(return_counts=False, dim=-1)
+
+                kvi = kvi[kvi != -1]
+                kvd = kvd[kvd != 0]
+                kvi = kvi.to(self.device)
+                #kvd = kvd.to(self.device)
+
+                paged_kv_indices = kvd
+
                 input_metadata.decode_wrapper.begin_forward(
                     paged_kv_indptr,
                     paged_kv_indices,
